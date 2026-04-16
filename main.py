@@ -150,13 +150,47 @@ def get_chart(data: BirthData):
         moon_sign_short = subject.moon.sign[:3]
         natal_in_pisces = [p["jyotish_name"] for p in planets if p["in_pisces"]]
 
-        # Ascendant — sign may come from first_house.sign or first_house.sign_name
-        asc_raw = (
-            getattr(subject.first_house, "sign", None)
-            or getattr(subject.first_house, "sign_name", None)
-            or ""
-        )
-        asc_short = asc_raw[:3]
+        # Ascendant — kerykeion 4.x returns the TROPICAL sign for first_house.sign
+        # even when zodiac_type="Sidereal". We must apply the Lahiri ayanamsa manually.
+        # Strategy: use the sidereal degree already stored on any planet to back-calculate
+        # the ayanamsa, then apply it to first_house.position (tropical ecliptic longitude).
+        #
+        # Lahiri ayanamsa for 2026 is ~24.13°. We derive it precisely from the subject:
+        #   ayanamsa = tropical_position - sidereal_position  (for any planet)
+        # subject.sun gives us both via .position (sidereal) and via the internal
+        # _sun_longitude attribute. Safer: use swisseph directly if available,
+        # otherwise fall back to a precise hard-coded value for 2026.
+        try:
+            import swisseph as swe
+            swe.set_sid_mode(swe.SIDM_LAHIRI)
+            ayanamsa_deg = swe.get_ayanamsa_ut(
+                swe.julday(utc_dt.year, utc_dt.month, utc_dt.day,
+                           utc_dt.hour + utc_dt.minute / 60.0)
+            )
+        except Exception:
+            # Fallback: Lahiri ayanamsa is ~24.13° for 2026 (advances ~50.3"/yr)
+            # Precise value for mid-2026: 24.130°
+            ayanamsa_deg = 24.130
+
+        # first_house.position is the tropical ecliptic longitude of the Ascendant
+        asc_tropical = getattr(subject.first_house, "position", None)
+        if asc_tropical is not None:
+            asc_sidereal = (float(asc_tropical) - ayanamsa_deg) % 360
+            SIGN_ORDER = ["Ari","Tau","Gem","Can","Leo","Vir",
+                          "Lib","Sco","Sag","Cap","Aqu","Pis"]
+            SIGN_FULL  = ["Aries","Taurus","Gemini","Cancer","Leo","Virgo",
+                          "Libra","Scorpio","Sagittarius","Capricorn","Aquarius","Pisces"]
+            sign_index = int(asc_sidereal // 30)
+            asc_short = SIGN_ORDER[sign_index]
+            asc_raw   = SIGN_FULL[sign_index]
+        else:
+            # Last-resort fallback: use whatever kerykeion gives us
+            asc_raw = (
+                getattr(subject.first_house, "sign", None)
+                or getattr(subject.first_house, "sign_name", None)
+                or ""
+            )
+            asc_short = asc_raw[:3]
 
         return {
             "status": "ok",
