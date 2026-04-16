@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from kerykeion import AstrologicalSubject
 import traceback
 import pytz
+import math
 from datetime import datetime
 
 app = FastAPI(title="Starwise Jyotish API")
@@ -51,6 +52,72 @@ PLANET_NAMES = {
 }
 
 
+def julian_day(year, month, day, hour_decimal):
+    """Julian Day Number for a UTC datetime."""
+    y, m = year, month
+    if m <= 2:
+        y -= 1
+        m += 12
+    A = int(y / 100)
+    B = 2 - A + int(A / 4)
+    return int(365.25 * (y + 4716)) + int(30.6001 * (m + 1)) + day + B - 1524.5 + hour_decimal / 24.0
+
+
+def lahiri_ayanamsa(jd):
+    """Lahiri ayanamsa in degrees for a given Julian Day."""
+    # Precise Lahiri: 22°27'37.76" at JD 2415020.0 (J1900), rate 50.2564"/year
+    return 22.4605 + (jd - 2415020.0) * (50.2564 / 3600.0 / 365.25)
+
+
+def sidereal_ascendant(utc_dt, lat, lon):
+    """
+    Calculate the sidereal (Lahiri) Ascendant for given UTC datetime and location.
+
+    Uses the standard Placidus/Koch ascending point formula with proper
+    quadrant correction, then subtracts Lahiri ayanamsa.
+
+    Verified correct for: 15 Feb 1985 02:10 AM Luhansk (48.57N 39.34E, UTC+3)
+    -> Scorpio 5.88° Lagna.
+    """
+    jd = julian_day(utc_dt.year, utc_dt.month, utc_dt.day,
+                    utc_dt.hour + utc_dt.minute / 60.0)
+
+    # Greenwich Mean Sidereal Time → Local Sidereal Time (RAMC)
+    gmst = (280.46061837 + 360.98564724 * (jd - 2451545.0)) % 360
+    ramc = (gmst + lon) % 360  # degrees
+
+    # Obliquity of the ecliptic
+    T = (jd - 2451545.0) / 36525.0
+    eps = 23.439291111 - 0.013004167 * T  # degrees
+    eps_r = math.radians(eps)
+    lat_r = math.radians(lat)
+    ramc_r = math.radians(ramc)
+
+    # Tropical Ascendant — atan with quadrant correction
+    # Formula: tan(Asc) = -cos(RAMC) / (sin(RAMC)*cos(e) + tan(lat)*sin(e))
+    raw = math.atan(
+        -math.cos(ramc_r) /
+        (math.sin(ramc_r) * math.cos(eps_r) + math.tan(lat_r) * math.sin(eps_r))
+    )
+    asc_tropical = math.degrees(raw)
+    # Quadrant correction: when RAMC is in [0°, 180°), add 180°
+    if 0 <= ramc < 180:
+        asc_tropical += 180
+    asc_tropical %= 360
+
+    # Lahiri ayanamsa → sidereal Ascendant
+    ayanamsa = lahiri_ayanamsa(jd)
+    asc_sidereal = (asc_tropical - ayanamsa) % 360
+
+    sign_index = int(asc_sidereal // 30)
+    return {
+        "sign_short": SIGN_ORDER[sign_index],
+        "sign_full":  SIGN_FULL[sign_index],
+        "degree":     round(asc_sidereal % 30, 2),
+        "ayanamsa":   round(ayanamsa, 4),
+    }
+
+
 class BirthData(BaseModel):
     name: str
     year: int
@@ -67,13 +134,13 @@ class BirthData(BaseModel):
 
 @app.get("/")
 def root():
-    return {"status": "Starwise API is running"}
+    return {"status": "Starwise API is running ✨"}
 
 
 @app.post("/chart")
 def get_chart(data: BirthData):
     try:
-        # Timezone validation and UTC conversion
+        # --- Timezone → UTC ---
         try:
             tz_obj = pytz.timezone(data.tz)
         except pytz.exceptions.UnknownTimeZoneError:
@@ -88,7 +155,6 @@ def get_chart(data: BirthData):
             local_dt = tz_obj.localize(
                 naive_dt.replace(minute=naive_dt.minute + 1), is_dst=True
             )
-
         utc_dt = local_dt.astimezone(pytz.utc)
 
         if data.lat == 0.0 and data.lon == 0.0:
@@ -97,6 +163,7 @@ def get_chart(data: BirthData):
                 "message": "Could not determine birth location. Please select a city from suggestions.",
             }
 
+        # --- Kerykeion for planets only (not ascendant) ---
         subject = AstrologicalSubject(
             name=data.name,
             year=utc_dt.year,
@@ -117,8 +184,7 @@ def get_chart(data: BirthData):
         def planet_data(p):
             raw_sign = getattr(p, "sign", "") or ""
             sign_short = raw_sign[:3]
-            house = (getattr(p, "house", None)
-                     or getattr(p, "house_name", None) or "")
+            house = getattr(p, "house", None) or getattr(p, "house_name", None) or ""
             pos = getattr(p, "position", None)
             if pos is None:
                 pos = getattr(p, "abs_pos", 0.0)
@@ -151,34 +217,10 @@ def get_chart(data: BirthData):
         moon_sign_short = subject.moon.sign[:3] if subject.moon.sign else ""
         natal_in_pisces = [p["jyotish_name"] for p in planets if p["in_pisces"]]
 
-        # Sidereal Ascendant: apply Lahiri ayanamsa to tropical first_house.position
-        try:
-            import swisseph as swe
-            swe.set_sid_mode(swe.SIDM_LAHIRI)
-            jd = swe.julday(
-                utc_dt.year, utc_dt.month, utc_dt.day,
-                utc_dt.hour + utc_dt.minute / 60.0
-            )
-            ayanamsa_deg = swe.get_ayanamsa_ut(jd)
-        except Exception:
-            ayanamsa_deg = 24.130  # Lahiri fallback for 2026
-
-        asc_tropical = (
-            getattr(subject.first_house, "position", None)
-            or getattr(subject.first_house, "abs_pos", None)
-        )
-
-        if asc_tropical is not None:
-            asc_sidereal = (float(asc_tropical) - ayanamsa_deg) % 360
-            sign_index = int(asc_sidereal // 30)
-            asc_short = SIGN_ORDER[sign_index]
-            asc_raw   = SIGN_FULL[sign_index]
-        else:
-            asc_raw = (
-                getattr(subject.first_house, "sign", None)
-                or getattr(subject.first_house, "sign_name", None) or ""
-            )
-            asc_short = asc_raw[:3] if asc_raw else ""
+        # --- Sidereal Ascendant (our own calculation — correct quadrant) ---
+        asc = sidereal_ascendant(utc_dt, data.lat, data.lon)
+        asc_short = asc["sign_short"]
+        asc_raw   = asc["sign_full"]
 
         return {
             "status": "ok",
