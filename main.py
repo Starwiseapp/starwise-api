@@ -119,6 +119,8 @@ def get_chart(data: BirthData):
 
         def planet_data(p):
             sign_short = p.sign[:3] if p.sign else ""
+            # Kerykeion 4.x renamed house_name → house; support both versions
+            house = getattr(p, "house", None) or getattr(p, "house_name", None) or ""
             return {
                 "name": p.name,
                 "jyotish_name": PLANET_NAMES.get(p.name, p.name),
@@ -126,7 +128,7 @@ def get_chart(data: BirthData):
                 "sign_jyotish": SIGN_NAMES.get(sign_short, p.sign),
                 "sign_short": sign_short,
                 "degree": round(p.position, 2),
-                "house": p.house_name,
+                "house": house,
                 "retrograde": p.retrograde,
                 "in_pisces": sign_short == "Pis",
             }
@@ -148,14 +150,22 @@ def get_chart(data: BirthData):
         moon_sign_short = subject.moon.sign[:3]
         natal_in_pisces = [p["jyotish_name"] for p in planets if p["in_pisces"]]
 
+        # Ascendant — sign may come from first_house.sign or first_house.sign_name
+        asc_raw = (
+            getattr(subject.first_house, "sign", None)
+            or getattr(subject.first_house, "sign_name", None)
+            or ""
+        )
+        asc_short = asc_raw[:3]
+
         return {
             "status": "ok",
             "name": data.name,
             "moon_sign": subject.moon.sign,
             "moon_sign_jyotish": SIGN_NAMES.get(moon_sign_short, subject.moon.sign),
             "moon_sign_short": moon_sign_short,
-            "ascendant": subject.first_house.sign,
-            "ascendant_jyotish": SIGN_NAMES.get(subject.first_house.sign[:3], subject.first_house.sign),
+            "ascendant": asc_raw,
+            "ascendant_jyotish": SIGN_NAMES.get(asc_short, asc_raw),
             "planets": planets,
             "natal_in_pisces": natal_in_pisces,
             "city": data.city,
