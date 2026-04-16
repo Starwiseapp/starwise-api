@@ -1,4 +1,6 @@
 fastapi==0.111.0
 uvicorn==0.29.0
-kerykeion==5.12.7
+kerykeion==4.20.1
 pydantic==2.7.1
+pytz>=2024.1
+pyswisseph>=2.10.0
