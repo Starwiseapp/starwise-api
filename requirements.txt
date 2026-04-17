@@ -4,3 +4,4 @@ kerykeion==4.26.3
 pydantic==2.7.1
 pytz>=2024.1
 pyswisseph>=2.10.0
+requests>=2.31.0

@@ -1,10 +1,13 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 from kerykeion import AstrologicalSubject
 import traceback
 import pytz
 import math
+import os
+import requests as http_req
 from datetime import datetime
 
 app = FastAPI(title="Starwise Jyotish API")
@@ -15,6 +18,57 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ── HubSpot ──────────────────────────────────────────────────────────────────
+# Set HS_ACCESS_TOKEN as an environment variable in Render.
+# Never hard-code the token here.
+HS_ACCESS_TOKEN = os.environ.get("HS_ACCESS_TOKEN", "")
+HS_API_BASE = "https://api.hubapi.com"
+
+
+def upsert_hubspot_contact(props: dict):
+    """
+    Create or update a HubSpot contact by email (server-side, non-blocking).
+    Runs inside a FastAPI BackgroundTask so it never delays the chart response.
+    """
+    if not HS_ACCESS_TOKEN:
+        return
+    email = props.get("email", "").strip()
+    if not email:
+        return
+
+    headers = {
+        "Authorization": f"Bearer {HS_ACCESS_TOKEN}",
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # 1. Try to create the contact
+        r = http_req.post(
+            f"{HS_API_BASE}/crm/v3/objects/contacts",
+            headers=headers,
+            json={"properties": props},
+            timeout=10,
+        )
+
+        if r.status_code == 409:
+            # Contact already exists → update by email
+            http_req.patch(
+                f"{HS_API_BASE}/crm/v3/objects/contacts/{email}",
+                headers=headers,
+                params={"idProperty": "email"},
+                json={"properties": props},
+                timeout=10,
+            )
+        elif not r.ok:
+            # Log any unexpected errors (visible in Render logs)
+            print(f"[HubSpot] Error {r.status_code}: {r.text}")
+
+    except Exception as e:
+        print(f"[HubSpot] Exception: {e}")
+
+
+# ── Astrology constants ───────────────────────────────────────────────────────
 
 SIGN_NAMES = {
     "Ari": "Mesha (Aries)",
@@ -94,13 +148,11 @@ def sidereal_ascendant(utc_dt, lat, lon):
     ramc_r = math.radians(ramc)
 
     # Tropical Ascendant — atan with quadrant correction
-    # Formula: tan(Asc) = -cos(RAMC) / (sin(RAMC)*cos(e) + tan(lat)*sin(e))
     raw = math.atan(
         -math.cos(ramc_r) /
         (math.sin(ramc_r) * math.cos(eps_r) + math.tan(lat_r) * math.sin(eps_r))
     )
     asc_tropical = math.degrees(raw)
-    # Quadrant correction: when RAMC is in [0°, 180°), add 180°
     if 0 <= ramc < 180:
         asc_tropical += 180
     asc_tropical %= 360
@@ -130,6 +182,8 @@ class BirthData(BaseModel):
     lat: float
     lon: float
     tz: str
+    email: Optional[str] = ""
+    lang: Optional[str] = "en"
 
 
 @app.get("/")
@@ -138,7 +192,7 @@ def root():
 
 
 @app.post("/chart")
-def get_chart(data: BirthData):
+def get_chart(data: BirthData, background_tasks: BackgroundTasks):
     try:
         # --- Timezone → UTC ---
         try:
@@ -215,6 +269,7 @@ def get_chart(data: BirthData):
         ]
 
         moon_sign_short = subject.moon.sign[:3] if subject.moon.sign else ""
+        moon_sign_jyotish = SIGN_NAMES.get(moon_sign_short, subject.moon.sign)
         natal_in_pisces = [p["jyotish_name"] for p in planets if p["in_pisces"]]
 
         # --- Sidereal Ascendant (our own calculation — correct quadrant) ---
@@ -222,11 +277,24 @@ def get_chart(data: BirthData):
         asc_short = asc["sign_short"]
         asc_raw   = asc["sign_full"]
 
+        # --- HubSpot: upsert contact in background (non-blocking) ---
+        if data.email:
+            hs_props = {
+                "email":              data.email.strip(),
+                "firstname":          data.name,
+                "city":               data.city,
+                "birth_date__time":   f"{data.year}-{data.month:02d}-{data.day:02d} {data.hour:02d}:{data.minute:02d}",
+                "preferred_language": (data.lang or "en").upper(),
+                "source_website":     "Starwise",
+                "moon_sign":          moon_sign_jyotish,
+            }
+            background_tasks.add_task(upsert_hubspot_contact, hs_props)
+
         return {
             "status": "ok",
             "name": data.name,
             "moon_sign": subject.moon.sign,
-            "moon_sign_jyotish": SIGN_NAMES.get(moon_sign_short, subject.moon.sign),
+            "moon_sign_jyotish": moon_sign_jyotish,
             "moon_sign_short": moon_sign_short,
             "ascendant": asc_raw,
             "ascendant_jyotish": SIGN_NAMES.get(asc_short, asc_raw),
